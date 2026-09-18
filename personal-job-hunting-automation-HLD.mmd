@@ -1,0 +1,1029 @@
+# Personal Job Hunting Automation Platform — High-Level Design
+
+## 1. Objective
+
+Build a personal job-hunting platform that continuously discovers jobs from multiple sources, normalizes and deduplicates them, evaluates relevance against the candidate profile, generates job-specific resume variants in LaTeX, and assists with application submission through browser automation where permitted.
+
+The system is intended for personal use and should prioritize reliability, traceability, human review, and source-specific compliance over indiscriminate auto-application.
+
+## 2. Core Requirements
+
+### Functional Requirements
+
+- Discover new and existing jobs from:
+  - Job APIs and aggregators
+  - Public ATS/job-board APIs
+  - Company career pages
+  - Generic company websites with custom career pages
+  - Other permitted sources
+- Maintain a company registry and career-page metadata.
+- Detect ATS providers such as Greenhouse, Lever, Ashby, Workable, and SmartRecruiters.
+- Crawl custom career pages when no supported API/ATS integration exists.
+- Normalize jobs into a common schema.
+- Deduplicate jobs appearing across multiple sources.
+- Track first-seen, last-seen, and posted timestamps.
+- Maintain a structured candidate profile.
+- Parse job requirements.
+- Calculate deterministic job-candidate matching.
+- Use an LLM for semantic requirement analysis and structured extraction.
+- Store a master LaTeX resume.
+- Generate job-specific resume variants.
+- Compile LaTeX into PDF.
+- Store resume versions and associate them with applications.
+- Analyze application forms.
+- Map form fields to the candidate profile.
+- Generate answers for custom application questions.
+- Automate form filling through Playwright where permitted.
+- Provide human approval before final submission by default.
+- Track application status and application events.
+- Provide a dashboard for jobs, resumes, applications, and analytics.
+- Support scheduled ingestion and recurring crawling.
+
+### Non-Functional Requirements
+
+- Idempotent ingestion.
+- Source-level rate limiting.
+- Retry with exponential backoff.
+- Queue-based processing.
+- Auditability.
+- Secure handling of resume and personal data.
+- Secrets stored outside source code.
+- Modular source connectors.
+- Failure isolation between sources.
+- Observability and structured logging.
+- Human-in-the-loop controls.
+- Respect website terms, robots directives where applicable, API limits, and anti-automation controls.
+
+## 3. High-Level Architecture
+
+```mermaid
+flowchart TB
+    U[User] --> UI[Next.js Web Dashboard]
+
+    UI --> API[Backend API / Application Service]
+
+    API --> DB[(PostgreSQL)]
+    API --> REDIS[(Redis)]
+
+    SCHED[Scheduler / Cron] --> IQ[Ingestion Queue]
+
+    IQ --> AGG[Aggregator Connectors]
+    IQ --> ATS[ATS Connectors]
+    IQ --> CRAWL[Company Career Crawlers]
+
+    AGG --> NORM[Job Normalizer]
+    ATS --> NORM
+    CRAWL --> NORM
+
+    NORM --> DEDUP[Deduplication Engine]
+    DEDUP --> DB
+
+    DB --> MATCH[Job Matching Engine]
+    MATCH --> AI[LLM Service]
+    AI --> MATCH
+    MATCH --> DB
+
+    DB --> RESUME[Resume Engine]
+    RESUME --> LATEX[LaTeX Compiler]
+    LATEX --> STORAGE[(Object Storage)]
+    STORAGE --> DB
+
+    DB --> APP[Application Orchestrator]
+    APP --> FORM[Form Analyzer]
+    FORM --> AI
+    APP --> BROWSER[Playwright Browser Worker]
+    BROWSER --> TARGET[Permitted Application Website]
+
+    APP --> DB
+
+    DB --> ANALYTICS[Application Analytics]
+    ANALYTICS --> UI
+```
+
+## 4. Source Architecture
+
+The system should not depend on one job portal.
+
+```mermaid
+flowchart LR
+    SOURCE[Job Sources] --> ROUTER[Source Router]
+
+    ROUTER --> API[API Connectors]
+    ROUTER --> ATS[ATS Connectors]
+    ROUTER --> WEB[Generic Web Crawler]
+
+    API --> A1[Adzuna]
+    API --> A2[Jooble]
+    API --> A3[Other permitted APIs]
+
+    ATS --> G1[Greenhouse]
+    ATS --> L1[Lever]
+    ATS --> AS1[Ashby]
+    ATS --> W1[Workable]
+    ATS --> S1[SmartRecruiters]
+
+    WEB --> DETECT[ATS / Career Page Detection]
+    DETECT --> ATS
+    DETECT --> CUSTOM[Custom Career Page Parser]
+
+    CUSTOM --> NORM[Canonical Job Model]
+    A1 --> NORM
+    A2 --> NORM
+    A3 --> NORM
+    G1 --> NORM
+    L1 --> NORM
+    AS1 --> NORM
+    W1 --> NORM
+    S1 --> NORM
+```
+
+## 5. Company Discovery
+
+Maintain a company registry instead of hard-coding scrapers for every company.
+
+```mermaid
+flowchart TD
+    SEED[Company Seeds] --> REG[Company Registry]
+    REG --> DISC[Career Page Discovery]
+    DISC --> URLS[Candidate Career URLs]
+    URLS --> FETCH[Fetch Career Page]
+    FETCH --> DETECT[Detect ATS / Custom Site]
+    DETECT --> META[Store Source Metadata]
+    META --> REG
+```
+
+Example company record:
+
+```json
+{
+  "name": "Example Company",
+  "domain": "example.com",
+  "careerUrl": "https://example.com/careers",
+  "ats": "ashby",
+  "active": true,
+  "priority": "high",
+  "lastCrawledAt": "..."
+}
+```
+
+## 6. Job Ingestion Pipeline
+
+```mermaid
+sequenceDiagram
+    participant S as Scheduler
+    participant Q as Queue
+    participant C as Connector
+    participant N as Normalizer
+    participant D as Deduplicator
+    participant DB as PostgreSQL
+
+    S->>Q: Create ingestion job
+    Q->>C: Execute connector
+    C->>C: Fetch jobs
+    C->>N: Raw job
+    N->>N: Normalize fields
+    N->>D: Canonical job
+    D->>D: Generate fingerprint
+    D->>DB: Insert / update job
+    DB-->>D: Stored state
+```
+
+## 7. Canonical Job Model
+
+```typescript
+interface Job {
+  id: string;
+
+  source: {
+    platform: string;
+    sourceJobId?: string;
+    url: string;
+  };
+
+  company: {
+    id?: string;
+    name: string;
+    domain?: string;
+    logo?: string;
+  };
+
+  title: string;
+  description: string;
+
+  location: {
+    city?: string;
+    state?: string;
+    country?: string;
+    remote?: boolean;
+    workplaceType?: "remote" | "hybrid" | "onsite";
+  };
+
+  employmentType?: string;
+
+  salary?: {
+    min?: number;
+    max?: number;
+    currency?: string;
+  };
+
+  skills: string[];
+
+  experience?: {
+    min?: number;
+    max?: number;
+  };
+
+  postedAt?: Date;
+  firstSeenAt: Date;
+  lastSeenAt: Date;
+
+  applicationUrl: string;
+  hash: string;
+}
+```
+
+## 8. Deduplication
+
+A single job may appear on multiple platforms.
+
+```mermaid
+flowchart TD
+    J1[LinkedIn Job] --> FP[Fingerprint / Similarity]
+    J2[Naukri Job] --> FP
+    J3[Indeed Job] --> FP
+    J4[Adzuna Job] --> FP
+    J5[Company Career Job] --> FP
+
+    FP --> SAME{Same Job?}
+
+    SAME -->|Yes| MERGE[Merge Sources]
+    SAME -->|No| NEW[Create Job]
+
+    MERGE --> DB[(PostgreSQL)]
+    NEW --> DB
+```
+
+Use a deterministic fingerprint based on normalized company, title, location, and description. Add fuzzy or semantic similarity for near-duplicates.
+
+## 9. Candidate Profile
+
+The candidate profile is the source of truth for applications and resume generation.
+
+```json
+{
+  "personal": {
+    "name": "...",
+    "email": "...",
+    "phone": "...",
+    "location": "..."
+  },
+  "professional": {
+    "experienceYears": 1,
+    "skills": [],
+    "github": "...",
+    "linkedin": "...",
+    "portfolio": "..."
+  },
+  "education": [],
+  "experience": [],
+  "projects": [],
+  "preferences": {
+    "roles": [],
+    "locations": [],
+    "remote": true
+  },
+  "application": {
+    "noticePeriod": "...",
+    "workAuthorization": "...",
+    "expectedSalary": "..."
+  }
+}
+```
+
+## 10. Job Matching Engine
+
+Do not delegate the complete matching decision to an LLM.
+
+```mermaid
+flowchart LR
+    JOB[Normalized Job] --> REQ[Requirement Extraction]
+    PROFILE[Candidate Profile] --> MATCH[Matching Engine]
+    REQ --> MATCH
+
+    MATCH --> D[Deterministic Signals]
+    MATCH --> AI[Semantic LLM Analysis]
+
+    D --> SCORE[Combined Match Result]
+    AI --> SCORE
+
+    SCORE --> DB[(PostgreSQL)]
+```
+
+Potential deterministic signals:
+
+```text
+Skills:       40%
+Experience:   20%
+Location:     15%
+Role:         15%
+Other:        10%
+```
+
+These percentages are configurable and should not be treated as universal truth.
+
+LLM output should be structured:
+
+```json
+{
+  "requiredSkills": [],
+  "preferredSkills": [],
+  "missingSkills": [],
+  "relevantExperience": [],
+  "semanticMatchNotes": [],
+  "recommendationReason": "..."
+}
+```
+
+## 11. Resume Management
+
+Use a master resume plus modular sections.
+
+```text
+resume/
+├── master.tex
+├── sections/
+│   ├── experience.tex
+│   ├── projects.tex
+│   ├── skills.tex
+│   └── education.tex
+└── versions/
+```
+
+## 12. AI Resume Customization
+
+```mermaid
+flowchart TD
+    MASTER[Master Resume] --> PARSE[Resume Structure]
+    JOB[Target Job] --> REQ[Job Requirements]
+    PROFILE[Candidate Profile] --> AI[LLM Resume Planner]
+
+    PARSE --> AI
+    REQ --> AI
+    PROFILE --> AI
+
+    AI --> PLAN[Structured Resume Modification Plan]
+    PLAN --> LATEX[LaTeX Generator]
+    LATEX --> COMPILE[pdflatex]
+    COMPILE --> PDF[Resume PDF]
+    PDF --> STORAGE[(Object Storage)]
+    STORAGE --> DB[(PostgreSQL)]
+```
+
+The AI should modify supported sections rather than freely rewrite the entire resume.
+
+Example modification plan:
+
+```json
+{
+  "targetRole": "Frontend Developer",
+  "emphasis": [
+    "React",
+    "Next.js",
+    "JavaScript",
+    "REST APIs"
+  ],
+  "projectsToEmphasize": [],
+  "experienceChanges": [],
+  "skillsOrdering": []
+}
+```
+
+## 13. Application Automation
+
+Application automation should be a separate subsystem from job discovery.
+
+```mermaid
+flowchart TD
+    APPLY[Apply Action] --> URL[Application URL]
+    URL --> SITE[Detect Application Site]
+    SITE --> FORM[Inspect Form]
+    FORM --> CLASSIFY[Classify Fields]
+
+    PROFILE[Candidate Profile] --> MAP[Field Mapping]
+    CLASSIFY --> MAP
+
+    MAP --> ANSWER[Generate Missing Answers]
+    ANSWER --> VALIDATE[Validate Data]
+
+    VALIDATE --> REVIEW[Human Review]
+    REVIEW -->|Approved| BROWSER[Playwright Worker]
+    REVIEW -->|Edit| ANSWER
+
+    BROWSER --> SUBMIT[Submit Where Permitted]
+    SUBMIT --> EVENT[Application Event]
+    EVENT --> DB[(PostgreSQL)]
+```
+
+## 14. Form Field Mapping
+
+Example:
+
+```text
+First Name       -> candidate.firstName
+Last Name        -> candidate.lastName
+Email            -> candidate.email
+Phone            -> candidate.phone
+LinkedIn         -> candidate.linkedin
+GitHub           -> candidate.github
+Portfolio        -> candidate.portfolio
+Resume           -> selected resume PDF
+Experience       -> candidate.experience
+Notice Period    -> candidate.noticePeriod
+```
+
+Custom questions can be passed through an LLM using only the relevant candidate profile and job context.
+
+## 15. Human-in-the-Loop
+
+Default workflow:
+
+```text
+Job
+ ↓
+Match
+ ↓
+Resume generated
+ ↓
+Application form analyzed
+ ↓
+Answers prepared
+ ↓
+Human review
+ ↓
+Apply
+```
+
+Do not bypass CAPTCHA, OTP, authentication challenges, anti-bot mechanisms, or website restrictions. When a site requires manual intervention, pause and hand control back to the user.
+
+## 16. Application State Machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> DISCOVERED
+    DISCOVERED --> MATCHED
+    MATCHED --> SHORTLISTED
+    SHORTLISTED --> RESUME_GENERATED
+    RESUME_GENERATED --> READY_TO_APPLY
+    READY_TO_APPLY --> REVIEW
+    REVIEW --> APPLIED
+    REVIEW --> SKIPPED
+    APPLIED --> REJECTED
+    APPLIED --> INTERVIEW
+    INTERVIEW --> OFFER
+    INTERVIEW --> REJECTED
+    OFFER --> ACCEPTED
+    OFFER --> REJECTED
+```
+
+## 17. Database Design
+
+Core tables:
+
+```text
+users
+candidate_profiles
+
+companies
+company_sources
+
+job_sources
+jobs
+job_source_links
+job_requirements
+job_matches
+
+resumes
+resume_versions
+resume_artifacts
+
+applications
+application_answers
+application_events
+
+crawl_runs
+ingestion_runs
+```
+
+Relationships:
+
+```mermaid
+erDiagram
+    CANDIDATE_PROFILE ||--o{ RESUME : owns
+    RESUME ||--o{ RESUME_VERSION : has
+
+    COMPANY ||--o{ JOB : publishes
+    JOB ||--o{ JOB_SOURCE_LINK : appears_on
+    JOB_SOURCE ||--o{ JOB_SOURCE_LINK : provides
+
+    JOB ||--o{ JOB_REQUIREMENT : contains
+    JOB ||--o{ JOB_MATCH : evaluated_for
+    CANDIDATE_PROFILE ||--o{ JOB_MATCH : receives
+
+    JOB ||--o{ APPLICATION : receives
+    RESUME_VERSION ||--o{ APPLICATION : used_for
+
+    APPLICATION ||--o{ APPLICATION_ANSWER : contains
+    APPLICATION ||--o{ APPLICATION_EVENT : generates
+```
+
+## 18. Queue Architecture
+
+Use Redis + BullMQ.
+
+```mermaid
+flowchart TD
+    SCHED[Scheduler] --> Q1[job-ingestion]
+    Q1 --> W1[Ingestion Workers]
+
+    W1 --> Q2[job-normalization]
+    Q2 --> W2[Normalization Workers]
+
+    W2 --> Q3[job-dedup]
+    Q3 --> W3[Dedup Workers]
+
+    W3 --> Q4[job-matching]
+    Q4 --> W4[Matching Workers]
+
+    W4 --> Q5[resume-generation]
+    Q5 --> W5[Resume Workers]
+
+    W5 --> Q6[application-preparation]
+    Q6 --> W6[Application Workers]
+
+    W6 --> Q7[browser-automation]
+    Q7 --> W7[Playwright Workers]
+```
+
+Each queue should support retries, backoff, concurrency limits, dead-letter handling, and idempotency.
+
+## 19. Suggested Backend Services
+
+For an initial implementation, these can remain in one Node.js application with modular workers.
+
+```text
+src/
+├── modules/
+│   ├── jobs/
+│   ├── companies/
+│   ├── sources/
+│   ├── matching/
+│   ├── resumes/
+│   ├── applications/
+│   ├── candidate/
+│   └── analytics/
+│
+├── connectors/
+│   ├── adzuna/
+│   ├── jooble/
+│   ├── greenhouse/
+│   ├── lever/
+│   ├── ashby/
+│   ├── workable/
+│   └── generic-crawler/
+│
+├── workers/
+│   ├── ingestion.worker.ts
+│   ├── normalization.worker.ts
+│   ├── matching.worker.ts
+│   ├── resume.worker.ts
+│   └── application.worker.ts
+│
+└── infrastructure/
+    ├── database/
+    ├── redis/
+    ├── storage/
+    └── observability/
+```
+
+Do not split this into many microservices initially. Use a modular monolith plus workers. Split services only when scaling or isolation actually requires it.
+
+## 20. Recommended Technology Stack
+
+### Frontend
+- Next.js
+- React
+- Tailwind CSS
+
+### Backend
+- Node.js
+- TypeScript
+- Fastify or NestJS
+
+### Database
+- PostgreSQL
+
+### Queue / Cache
+- Redis
+- BullMQ
+
+### Crawling / Browser Automation
+- Playwright
+- Cheerio for static HTML parsing
+
+### AI
+- OpenAI API
+- Structured JSON outputs
+- Embeddings only where semantic retrieval is actually useful
+
+### Resume
+- LaTeX
+- pdflatex / compatible LaTeX compiler
+
+### File Storage
+- S3-compatible object storage
+
+### Infrastructure
+- Docker
+- CI/CD
+- AWS, Railway, Render, or equivalent
+
+## 21. Security
+
+Sensitive data includes:
+
+```text
+Email
+Phone
+Resume
+Address if stored
+Application answers
+Job application history
+API keys
+Authentication credentials
+```
+
+Requirements:
+
+- Never hard-code API keys.
+- Encrypt sensitive data at rest where appropriate.
+- Use environment variables or a secret manager.
+- Restrict browser automation credentials.
+- Never log passwords, tokens, OTPs, or sensitive form values.
+- Separate application secrets from candidate profile data.
+- Keep audit logs for automated actions.
+- Allow deletion/export of personal data.
+- Use least-privilege credentials.
+
+## 22. Observability
+
+Track:
+
+```text
+crawl_started
+crawl_completed
+crawl_failed
+
+job_discovered
+job_updated
+job_deduplicated
+
+match_completed
+
+resume_generation_started
+resume_generation_failed
+resume_compiled
+
+application_started
+application_paused
+application_submitted
+application_failed
+```
+
+Metrics:
+
+```text
+jobs discovered/day
+unique jobs/day
+duplicate rate
+source failure rate
+match distribution
+resumes generated
+applications prepared
+applications submitted
+application success/failure rate
+```
+
+## 23. Failure Handling
+
+A single source failure must not stop the complete pipeline.
+
+```mermaid
+flowchart TD
+    JOB[Ingestion Job] --> TRY[Connector Execution]
+    TRY --> OK{Success?}
+
+    OK -->|Yes| NORMALIZE[Normalize]
+    OK -->|No| RETRY[Retry with Backoff]
+
+    RETRY --> LIMIT{Retry Limit?}
+    LIMIT -->|No| TRY
+    LIMIT -->|Yes| DLQ[Dead Letter Queue]
+
+    DLQ --> ALERT[Log / Alert]
+```
+
+## 24. Scheduling Strategy
+
+Example schedule:
+
+```text
+Every 2-4 hours:
+    High-priority company career pages
+
+Every 6 hours:
+    ATS connectors
+
+Every 6-12 hours:
+    Aggregator APIs
+
+Daily:
+    Lower-priority company pages
+
+Weekly:
+    Company discovery / career URL validation
+```
+
+Actual frequency should respect source limits and terms.
+
+## 25. Dashboard
+
+```text
+Dashboard
+
+Today's Jobs
+    New: 143
+    Matching: 31
+    Shortlisted: 12
+    Ready: 8
+    Applied: 6
+
+Filters:
+    Role
+    Location
+    Remote
+    Experience
+    Salary
+    Source
+    Company
+    Match
+
+Job Card:
+    Company
+    Title
+    Location
+    Match analysis
+    Required skills
+    Missing skills
+    Posted date
+    Sources
+    Resume version
+    Application status
+
+Actions:
+    View
+    Shortlist
+    Generate Resume
+    Prepare Application
+    Apply
+```
+
+## 26. Analytics
+
+Track the complete funnel:
+
+```text
+Discovered
+   ↓
+Matched
+   ↓
+Shortlisted
+   ↓
+Application Prepared
+   ↓
+Applied
+   ↓
+Interview
+   ↓
+Offer
+```
+
+This allows analysis such as:
+
+```text
+Which roles produce interviews?
+Which resume versions perform better?
+Which sources produce relevant jobs?
+Which skills are frequently missing?
+Which companies have repeated openings?
+```
+
+## 27. Implementation Roadmap
+
+### Phase 1 — MVP
+
+Build:
+
+```text
+Next.js dashboard
+PostgreSQL
+Candidate profile
+Adzuna connector
+Jooble connector
+Job normalization
+Deduplication
+Basic filtering
+Application tracking
+```
+
+### Phase 2 — ATS Integration
+
+Add:
+
+```text
+Greenhouse
+Lever
+Ashby
+Workable
+SmartRecruiters
+```
+
+Add company registry and ATS detection.
+
+### Phase 3 — Company Crawler
+
+Build:
+
+```text
+Career URL discovery
+ATS detection
+Generic HTML parser
+Playwright fallback
+Crawl scheduling
+Rate limiting
+```
+
+### Phase 4 — AI Matching
+
+Add:
+
+```text
+Job requirement extraction
+Candidate-job semantic analysis
+Deterministic scoring
+Missing skill analysis
+Shortlisting
+```
+
+### Phase 5 — Resume Engine
+
+Add:
+
+```text
+Master LaTeX resume
+Modular sections
+AI customization planner
+LaTeX compilation
+PDF storage
+Resume versioning
+Job-resume association
+```
+
+### Phase 6 — Application Assistant
+
+Add:
+
+```text
+Application URL detection
+Form extraction
+Field classification
+Candidate-profile mapping
+AI question answering
+Playwright form filling
+Human approval
+Application event tracking
+```
+
+### Phase 7 — Optimization
+
+Add:
+
+```text
+Application analytics
+Source reliability metrics
+Resume performance analysis
+Company discovery
+Improved deduplication
+Failure recovery
+Observability
+```
+
+## 28. Core Design Principles
+
+1. APIs first, ATS endpoints second, generic scraping third.
+2. Normalize every source into one canonical Job model.
+3. Treat LinkedIn, Naukri, Indeed, and Glassdoor as optional source connectors rather than architectural dependencies.
+4. Never write a separate scraper for every company when an ATS adapter can serve many companies.
+5. Separate discovery from application automation.
+6. Keep deterministic business logic outside the LLM.
+7. Use LLMs for semantic extraction, reasoning, and controlled content generation.
+8. Keep the master resume as the source of truth.
+9. Version every generated resume.
+10. Associate every application with the exact resume version used.
+11. Make ingestion idempotent.
+12. Use queues for long-running and failure-prone operations.
+13. Keep a complete audit trail.
+14. Default to human approval before final application submission.
+15. Never design around bypassing CAPTCHA, OTP, authentication, anti-bot systems, or explicit site restrictions.
+16. Start as a modular monolith and workers, not a premature microservice architecture.
+
+## 29. Target End State
+
+```mermaid
+flowchart TB
+    USER[User]
+
+    USER --> DASH[Personal Job Dashboard]
+
+    subgraph DISCOVERY[Job Discovery]
+        API[Job APIs]
+        ATS[ATS APIs]
+        COMPANY[Company Career Pages]
+        CRAWLER[Generic Crawler]
+    end
+
+    API --> INGEST[Ingestion]
+    ATS --> INGEST
+    COMPANY --> INGEST
+    CRAWLER --> INGEST
+
+    INGEST --> NORMALIZE[Normalize]
+    NORMALIZE --> DEDUP[Deduplicate]
+    DEDUP --> DB[(PostgreSQL)]
+
+    DB --> MATCH[Candidate Matching]
+    PROFILE[Candidate Profile] --> MATCH
+    MATCH --> SHORTLIST[Shortlist]
+
+    SHORTLIST --> RESUME[AI Resume Engine]
+    RESUME --> LATEX[LaTeX]
+    LATEX --> PDF[Versioned PDF]
+    PDF --> STORAGE[(Object Storage)]
+
+    SHORTLIST --> APPPREP[Application Preparation]
+    PROFILE --> APPPREP
+    PDF --> APPPREP
+
+    APPPREP --> REVIEW[Human Review]
+    REVIEW --> BROWSER[Playwright]
+    BROWSER --> APPLY[Application Website]
+
+    APPLY --> TRACK[Application Tracking]
+    TRACK --> DB
+
+    DB --> ANALYTICS[Analytics]
+    ANALYTICS --> DASH
+    DB --> DASH
+    MATCH --> DASH
+    RESUME --> DASH
+    TRACK --> DASH
+```
+
+## 30. Summary
+
+The platform should be designed as a source-agnostic job ingestion and application system.
+
+The core abstraction is:
+
+```text
+Many Sources
+    ↓
+Connectors
+    ↓
+Canonical Job
+    ↓
+Deduplication
+    ↓
+Candidate Matching
+    ↓
+Resume Version
+    ↓
+Application Preparation
+    ↓
+Human Approval
+    ↓
+Permitted Browser Automation
+    ↓
+Application Tracking
+```
+
+This architecture supports adding new job portals, ATS providers, and company career pages without redesigning the rest of the system.

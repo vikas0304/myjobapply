@@ -1,0 +1,138 @@
+flowchart TB
+    USER["User"]
+
+    %% Public Cloud $0 Tier
+    subgraph CLOUD_FREE_TIER["Public Cloud Infrastructure - $0 Perpetual Tier"]
+        V_UI["Vercel Serverless: Next.js UI"]
+        SUPA[("Supabase / Neon: PostgreSQL 16 + pgvector")]
+        UP_REDIS[("Upstash: Serverless Redis / BullMQ Streams")]
+        CF_R2[("Cloudflare R2: S3-Compatible Storage")]
+    end
+
+    %% Local $0 Runtime
+    subgraph LOCAL_RUNTIME["Host Machine / Local Docker Microservice Mesh - $0"]
+        API_GW["API Gateway / BFF Fastify: Node.js"]
+        AUTH["Auth & PII Guard"]
+        SCHED["Ingestion Scheduler"]
+        ORCH["Pipeline Orchestrator"]
+        EXT["Chrome Extension Sidecar: Manifest V3"]
+
+        subgraph WORKER_POOL["Isolated Microservice Workers"]
+            W_INGEST["Ingestion Worker: ATS / Portal APIs"]
+            W_DEDUP["Dedup & Match Worker: Local Transformers.js + pgvector"]
+            W_RESUME["Resume Worker: Sandboxed pdflatex --no-shell-escape"]
+            W_BROWSER["Browser Automation Worker: Headless Playwright"]
+        end
+
+        subgraph INGESTION_DETAIL["Source Connectors - run in W_INGEST"]
+            direction LR
+            ATS_CONN["ATS Direct Connectors\nGreenhouse, Lever, Ashby APIs"]
+            PORTAL_CONN["Job Portal Connectors\nAdzuna, Jooble APIs"]
+            CRAWLER_CONN["Fallback Playwright Crawler\nComplex JS / Career Pages"]
+        end
+
+        subgraph PROCESSING_DETAIL["Processing & Matching - run in W_DEDUP"]
+            direction TB
+            NORM["Canonical Normalizer"]
+            EXACT_HASH["Normalized Slug Hash\nCompany + Title + Location"]
+            VEC_SIM["pgvector Embedding / MinHash\n+ Local Transformers.js"]
+            HARD_FILTER["Deterministic Rule Filter\nYoE, Salary, Tech Constraints"]
+            NORM --> EXACT_HASH
+            EXACT_HASH --> VEC_SIM
+            VEC_SIM --> HARD_FILTER
+        end
+
+        SECURE_TEX["Sandboxed pdflatex Worker\nContainerized --no-shell-escape"]
+        HEADLESS_POOL["Isolated Headless Playwright Pool\nPermitted & Simple Workflows"]
+    end
+
+    %% AI Gateway Free-Tier Failover Chain
+    subgraph AI_CASCADE["AI Gateway - Free-Tier Failover Chain"]
+        direction TD
+        REQ["AI Request: Extraction / Matching / Resumes / Answers"]
+        GW["AI Gateway Client"]
+        L1{"Level 1: OpenRouter Free Pool"}
+        OR_PRIMARY["meta-llama / llama-3.3-70b-instruct:free"]
+        OR_SEC["qwen / qwen-2.5-72b-instruct:free"]
+        OR_TER["mistralai / mistral-small-24b-instruct-2501:free"]
+        L2{"Level 2: Standalone Free Fallback"}
+        GROQ["Groq API Free Tier: Llama-3.1-70b-versatile"]
+        GEMINI["Google AI Studio: Gemini 1.5 / 2.0 Flash Free"]
+        PARSE["JSON Schema Validation & Repair"]
+        RESP["Validated Structured Output"]
+        REQ --> GW
+        GW --> L1
+        L1 -->|Try| OR_PRIMARY
+        OR_PRIMARY -->|Rate Limit / 429| OR_SEC
+        OR_SEC -->|Rate Limit / 429| OR_TER
+        OR_TER -->|All Free Exhausted| L2
+        L2 -->|Direct Call| GROQ
+        GROQ -->|Rate Limit / 429| GEMINI
+        OR_PRIMARY -->|200 OK| PARSE
+        OR_SEC -->|200 OK| PARSE
+        OR_TER -->|200 OK| PARSE
+        GROQ -->|200 OK| PARSE
+        GEMINI -->|200 OK| PARSE
+        PARSE --> RESP
+    end
+
+    subgraph TARGETS["Target Submission Systems"]
+        JOB_SITES["Career Portals & External ATS"]
+    end
+
+    OBS["Observability\nOpenTelemetry, Metrics, Audit Logs"]
+
+    %% Client to Cloud/Local
+    USER --> V_UI
+    USER --> EXT
+    V_UI <--> API_GW
+    EXT <--> API_GW
+
+    %% API layer wiring
+    API_GW --> AUTH
+    API_GW --> ORCH
+    SCHED --> ORCH
+    ORCH --> UP_REDIS
+    API_GW <--> UP_REDIS
+    API_GW <--> SUPA
+
+    %% Queue to workers
+    UP_REDIS --> W_INGEST
+    UP_REDIS --> W_DEDUP
+    UP_REDIS --> W_RESUME
+    UP_REDIS --> W_BROWSER
+
+    %% Ingestion flow
+    W_INGEST --> ATS_CONN
+    W_INGEST --> PORTAL_CONN
+    W_INGEST --> CRAWLER_CONN
+    ATS_CONN --> NORM
+    PORTAL_CONN --> NORM
+    CRAWLER_CONN --> NORM
+    W_INGEST --> SUPA
+
+    %% Dedup / Match flow
+    HARD_FILTER --> REQ
+    RESP --> W_DEDUP
+    W_DEDUP <--> SUPA
+
+    %% Resume flow
+    W_RESUME --> REQ
+    RESP --> W_RESUME
+    W_RESUME --> SECURE_TEX
+    SECURE_TEX --> CF_R2
+    SECURE_TEX --> SUPA
+
+    %% Application dispatch - dual path
+    W_BROWSER --> REQ
+    RESP --> W_BROWSER
+    W_BROWSER --> SUPA
+    W_BROWSER -.->|Direct Automated Run| HEADLESS_POOL
+    W_BROWSER -.->|Sync Draft & Fields| EXT
+    HEADLESS_POOL -->|Automated Submit| JOB_SITES
+    EXT -->|Assisted Inject & User Submit| JOB_SITES
+
+    %% Observability
+    UP_REDIS --> OBS
+    W_BROWSER --> OBS
+    SECURE_TEX --> OBS
